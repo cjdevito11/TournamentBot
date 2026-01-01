@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 import aiomysql
 
@@ -35,30 +36,112 @@ class MatchRef:
     loser_event_team_id: Optional[int]
 
 
-def _next_pow2(n: int) -> int:
+MATCH_CODE_RE = re.compile(r"^(?:(GF)|([WL])(\d+))-(\d+)$", re.IGNORECASE)
+
+
+def next_power_of_two(n: int) -> int:
     if n <= 1:
         return 1
-    return 1 << (n - 1).bit_length()
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
 
 
-def _pair_seeded_round1(team_ids_sorted_by_seed: list[int], bracket_size: int) -> list[tuple[int, Optional[int]]]:
+def seeded_positions(n: int) -> list[int]:
     """
-    Simple seeding: 1 vs N, 2 vs N-1, etc (after padding with BYEs).
+    Standard tournament seed positions list (length n, n is power of two).
+    Example n=8 => [1,8,4,5,2,7,3,6]
     """
-    padded: list[Optional[int]] = list(team_ids_sorted_by_seed)
-    while len(padded) < bracket_size:
-        padded.append(None)
+    if n <= 1:
+        return [1]
+    if n == 2:
+        return [1, 2]
+    prev = seeded_positions(n // 2)
+    out: list[int] = []
+    for s in prev:
+        out.append(s)
+        out.append(n + 1 - s)
+    return out
 
-    pairs: list[tuple[int, Optional[int]]] = []
-    half = bracket_size // 2
-    for i in range(half):
-        t1 = padded[i]
-        t2 = padded[bracket_size - 1 - i]
+
+def parse_match_code(code: str) -> tuple[str, int, int]:
+    """
+    Accepts:
+      - W1-01, W2-1, L3-04
+      - GF-01, gf-2
+    Returns: (bracket, round_no, match_no)
+    """
+    c = (code or "").strip().upper()
+    m = MATCH_CODE_RE.match(c)
+    if not m:
+        raise BracketStateError("Invalid match_code. Use W1-01, L2-03, or GF-01 format.")
+
+    gf, wl, round_s, match_s = m.groups()
+
+    match_no = int(match_s)
+    if match_no < 1:
+        raise BracketStateError("match_no in match_code must be >= 1.")
+
+    if gf:
+        return ("GF", 1, match_no)
+
+    bracket = wl.upper()
+    round_no = int(round_s)
+    if round_no < 1:
+        raise BracketStateError("round_no in match_code must be >= 1.")
+
+    return (bracket, round_no, match_no)
+
+
+def _validate_seeds(teams: list[Mapping[str, Any]]) -> dict[int, int]:
+    """
+    Validates event_team seeds are 1..N with no gaps and unique.
+    Returns seed -> event_team_id mapping.
+    """
+    seeds: list[int] = []
+    for t in teams:
+        s = t.get("seed")
+        if s is None:
+            raise BracketStateError("All event teams must have a seed before creating a bracket.")
+        seeds.append(int(s))
+
+    if len(set(seeds)) != len(seeds):
+        raise BracketStateError("Duplicate seeds detected in event_team. Seeds must be unique.")
+
+    n = len(seeds)
+    if min(seeds) != 1 or max(seeds) != n:
+        raise BracketStateError("Seeds must be contiguous starting at 1 (1..N).")
+
+    seed_to_id: dict[int, int] = {}
+    for t in teams:
+        seed_to_id[int(t["seed"])] = int(t["event_team_id"])
+    return seed_to_id
+
+
+def _pair_round1_by_standard_seeding(seed_to_id: dict[int, int], team_count: int, bracket_size: int) -> list[tuple[int, Optional[int], int, Optional[int]]]:
+    """
+    Uses standard seed placement order. BYEs are any seed > team_count.
+    Returns list of tuples:
+      (team1_event_team_id, team2_event_team_id_or_none, seed1, seed2_or_none)
+    """
+    pos = seeded_positions(bracket_size)  # seeds 1..bracket_size in seeded order
+    out: list[tuple[int, Optional[int], int, Optional[int]]] = []
+
+    for i in range(0, bracket_size, 2):
+        seed1 = pos[i]
+        seed2 = pos[i + 1]
+
+        t1 = seed_to_id.get(seed1) if seed1 <= team_count else None
+        t2 = seed_to_id.get(seed2) if seed2 <= team_count else None
+
         if t1 is None:
-            # if we ever hit a None on the left, bracket creation is invalid
-            raise BracketStateError("Invalid seeding/padding state (missing team on left side).")
-        pairs.append((t1, t2))
-    return pairs
+            # should never happen if seeds are 1..N and seed1 is always a valid low seed
+            raise BracketStateError("Invalid seeding state: missing team for a required seed.")
+
+        out.append((t1, t2, seed1, seed2 if t2 is not None else None))
+
+    return out
 
 
 class BracketService:
@@ -80,12 +163,6 @@ class BracketService:
     # -------------------------
 
     async def create_bracket(self, *, event_id: int) -> None:
-        """
-        Create the initial bracket matches based on event.format.
-        Requires:
-          - event_team exists (generated/seeded)
-          - no event_match exists yet for this event
-        """
         existing = await self._repo.list_matches(event_id=event_id)
         if existing:
             raise BracketAlreadyExistsError("Matches already exist for this event.")
@@ -99,7 +176,7 @@ class BracketService:
         if not teams:
             raise BracketStateError("No event teams found. Generate/lock teams first.")
 
-        # sort by seed then id
+        # sort by seed then id (for validation + deterministic mapping)
         teams_sorted = sorted(
             teams,
             key=lambda t: (
@@ -108,29 +185,40 @@ class BracketService:
                 int(t["event_team_id"]),
             ),
         )
-        team_ids = [int(t["event_team_id"]) for t in teams_sorted]
 
-        bracket_size = _next_pow2(len(team_ids))
-        pairs = _pair_seeded_round1(team_ids, bracket_size)
+        seed_to_id = _validate_seeds(teams_sorted)
+        team_count = len(seed_to_id)
 
-        # Create Winners Bracket Round 1
-        for match_no, (t1, t2) in enumerate(pairs, start=1):
+        bracket_size = next_power_of_two(team_count)
+        pairs = _pair_round1_by_standard_seeding(seed_to_id, team_count, bracket_size)
+
+        # Create Winners Bracket Round 1 (W1)
+        for match_no, (t1, t2, seed1, seed2) in enumerate(pairs, start=1):
+            bracket = "W"
+            round_no = 1
+            code = f"W{round_no}-{match_no:02d}"
+
             match_id = await self._repo.create_match(
                 event_id=event_id,
-                bracket="W",
-                round_no=1,
+                bracket=bracket,
+                round_no=round_no,
                 match_no=match_no,
                 team1_event_team_id=t1,
                 team2_event_team_id=t2,
-                metadata={"generated": True, "bracket_size": bracket_size},
+                metadata={
+                    "generated": True,
+                    "bracket_size": bracket_size,
+                    "code": code,
+                    "seed1": seed1,
+                    "seed2": seed2,
+                },
             )
             if t2 is None:
                 await self._set_bye_winner(event_match_id=match_id, winner_event_team_id=t1)
 
-        # Try to auto-advance through any BYE-only rounds
+        # Auto-advance through any BYE-only rounds
         await self.advance(event_id=event_id)
 
-        # For double elimination, LB is created as results become available
         if fmt not in ("single_elim", "double_elim"):
             raise BracketStateError("Unsupported event format in DB (expected single_elim or double_elim).")
 
@@ -142,9 +230,6 @@ class BracketService:
         reported_by_account_id: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        """
-        Record a match result (non-BYE) and advance bracket accordingly.
-        """
         m = await self._repo.fetch_one("SELECT * FROM event_match WHERE event_match_id=%s;", (event_match_id,))
         if not m:
             raise BracketStateError("Match not found.")
@@ -155,7 +240,6 @@ class BracketService:
         t1 = int(m["team1_event_team_id"])
         t2 = int(m["team2_event_team_id"]) if m.get("team2_event_team_id") is not None else None
         if t2 is None:
-            # BYE match should be auto-completed
             await self._set_bye_winner(event_match_id=event_match_id, winner_event_team_id=t1)
             return
 
@@ -175,10 +259,52 @@ class BracketService:
 
         await self.advance(event_id=int(m["event_id"]))
 
+    async def record_result_by_code(
+        self,
+        *,
+        event_id: int,
+        match_code: str,
+        winner_seed: int,
+        reported_by_account_id: Optional[int] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> int:
+        """
+        Human-friendly reporting:
+          match_code: W1-01, L2-03, GF-01
+          winner_seed: 1..N (seed of the winning event_team)
+        Returns the resolved event_match_id.
+        """
+        bracket, round_no, match_no = parse_match_code(match_code)
+
+        m = await self._repo.fetch_one(
+            """
+            SELECT *
+            FROM event_match
+            WHERE event_id=%s AND bracket=%s AND round_no=%s AND match_no=%s;
+            """,
+            (event_id, bracket, round_no, match_no),
+        )
+        if not m:
+            raise BracketStateError(f"Match not found for event {event_id}: {bracket}{round_no}-{match_no:02d}")
+
+        row = await self._repo.fetch_one(
+            "SELECT event_team_id FROM event_team WHERE event_id=%s AND seed=%s;",
+            (event_id, int(winner_seed)),
+        )
+        if not row:
+            raise BracketStateError(f"Winner seed {winner_seed} does not exist for event {event_id}.")
+        winner_event_team_id = int(row["event_team_id"])
+
+        await self.record_result(
+            event_match_id=int(m["event_match_id"]),
+            winner_event_team_id=winner_event_team_id,
+            reported_by_account_id=reported_by_account_id,
+            metadata=metadata,
+        )
+
+        return int(m["event_match_id"])
+
     async def advance(self, *, event_id: int) -> None:
-        """
-        Advances bracket by creating next matches when prior rounds are complete.
-        """
         event = await self._repo.get_event(event_id=event_id)
         if not event:
             raise BracketStateError("Event not found.")
@@ -215,10 +341,6 @@ class BracketService:
     # -------------------------
 
     async def _set_bye_winner(self, *, event_match_id: int, winner_event_team_id: int) -> None:
-        """
-        Marks a BYE match as completed with winner set, loser NULL.
-        Uses direct SQL to avoid forcing repo signature changes.
-        """
         await self._repo.execute(
             """
             UPDATE event_match
@@ -246,7 +368,6 @@ class BracketService:
         for m in ms:
             w = m.get("winner_event_team_id")
             if w is None:
-                # should not happen if completed, but guard anyway
                 t1 = int(m["team1_event_team_id"])
                 t2 = int(m["team2_event_team_id"]) if m.get("team2_event_team_id") is not None else None
                 winners.append(t1 if t2 is None else t1)
@@ -257,7 +378,6 @@ class BracketService:
     def _losers_in_order(self, ms: list[Mapping[str, Any]]) -> list[int]:
         losers: list[int] = []
         for m in ms:
-            # only include real losses (non-bye)
             if m.get("team2_event_team_id") is None:
                 continue
             l = m.get("loser_event_team_id")
@@ -277,6 +397,10 @@ class BracketService:
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> Optional[int]:
         try:
+            code = f"{bracket}{round_no}-{match_no:02d}" if bracket in ("W", "L") else f"GF-{match_no:02d}"
+            md = dict(metadata) if metadata else {}
+            md.setdefault("code", code)
+
             match_id = await self._repo.create_match(
                 event_id=event_id,
                 bracket=bracket,
@@ -284,24 +408,21 @@ class BracketService:
                 match_no=match_no,
                 team1_event_team_id=t1,
                 team2_event_team_id=t2,
-                metadata=dict(metadata) if metadata else None,
+                metadata=md,
             )
             if t2 is None:
                 await self._set_bye_winner(event_match_id=match_id, winner_event_team_id=t1)
             return match_id
         except aiomysql.IntegrityError:
-            # Unique key hit: someone else created it concurrently; ignore.
             return None
 
     async def _advance_single_elim(self, event_id: int) -> None:
         matches = await self._repo.list_matches(event_id=event_id)
 
-        # Determine highest winners round that exists
         wb_rounds = sorted({int(m["round_no"]) for m in matches if str(m["bracket"]) == "W"})
         if not wb_rounds:
             return
 
-        # Iteratively generate next round as long as current is completed
         r = 1
         while True:
             curr = self._group(matches, "W", r)
@@ -310,14 +431,13 @@ class BracketService:
 
             winners = self._winners_in_order(curr)
             if len(winners) <= 1:
-                break  # champion reached
+                break
 
             next_round = r + 1
             if self._group(matches, "W", next_round):
                 r = next_round
-                continue  # already exists
+                continue
 
-            # create next round matches
             match_no = 1
             i = 0
             while i < len(winners):
@@ -339,51 +459,39 @@ class BracketService:
             r = next_round
 
     async def _advance_double_elim(self, event_id: int) -> None:
-        """
-        Practical double elim:
-          - WB advances like single elim
-          - LB rounds generated using:
-              LB1  from WB1 losers
-              LB2  winners(LB1) vs WB2 losers
-              LB3  winners(LB2)
-              LB4  winners(LB3) vs WB3 losers
-              ...
-              LB(2n-2) winners(LB(2n-3)) vs WB-final loser
-          - GF between WB champ and LB champ; if LB wins GF1, create GF2 reset.
-        """
         matches = await self._repo.list_matches(event_id=event_id)
 
-        # Always advance WB as far as possible first
         await self._advance_single_elim(event_id=event_id)
         matches = await self._repo.list_matches(event_id=event_id)
 
         wb_r1 = self._group(matches, "W", 1)
         if not wb_r1:
             return
+
         bracket_size = 2 * len(wb_r1)
+        if bracket_size <= 2:
+            # Two-team "double elim" behaves like single elim here (WB decides)
+            return
+
         n = int(math.log2(bracket_size)) if bracket_size > 0 else 0
 
-        # Helper to find if a bracket round exists
         def has_round(br: str, rn: int) -> bool:
             return bool(self._group(matches, br, rn))
 
-        # Build LB rounds in order as prerequisites become available
-        # LB round 1
+        # LB round 1 from WB1 losers
         if self._all_completed(wb_r1) and not has_round("L", 1):
             losers = self._losers_in_order(wb_r1)
             await self._create_round_from_pairs(event_id, "L", 1, losers, metadata={"generated": True, "source": "WB1"})
             matches = await self._repo.list_matches(event_id=event_id)
 
         # For WB rounds 2..n-1 build alternating LB rounds (even cross, odd pure)
-        for wb_round in range(2, max(2, n)):  # up to n-1 inclusive
+        for wb_round in range(2, max(2, n)):
             wb = self._group(matches, "W", wb_round)
             if not wb or not self._all_completed(wb):
                 break
 
-            # Ensure prior LB chain progressed
-            # Cross LB round = 2*wb_round - 2
             lb_cross = 2 * wb_round - 2
-            lb_prev = lb_cross - 1  # pure/initial before cross
+            lb_prev = lb_cross - 1
 
             if not has_round("L", lb_prev):
                 break
@@ -398,7 +506,6 @@ class BracketService:
                 await self._create_round_from_cross(event_id, lb_cross, entrants, metadata={"generated": True, "source": f"WB{wb_round}"})
                 matches = await self._repo.list_matches(event_id=event_id)
 
-            # Pure LB round after cross = 2*wb_round - 1
             lb_pure = lb_cross + 1
             lb_cross_matches = self._group(matches, "L", lb_cross)
             if self._all_completed(lb_cross_matches) and not has_round("L", lb_pure):
@@ -406,8 +513,7 @@ class BracketService:
                 await self._create_round_from_pairs(event_id, "L", lb_pure, lb_winners2, metadata={"generated": True, "source": f"L{lb_cross}"})
                 matches = await self._repo.list_matches(event_id=event_id)
 
-        # Handle WB final -> LB final cross -> GF
-        # WB final is round n (if it exists)
+        # WB final -> LB final -> GF
         wb_final = self._group(matches, "W", n)
         if not wb_final or not self._all_completed(wb_final):
             return
@@ -416,7 +522,6 @@ class BracketService:
         wb_final_losers = self._losers_in_order(wb_final)
         wb_final_loser = wb_final_losers[0] if wb_final_losers else None
 
-        # LB round 2n-2 (final cross) requires LB round 2n-3 completed
         lb_last_pure = 2 * n - 3
         lb_last_cross = 2 * n - 2
 
@@ -428,11 +533,9 @@ class BracketService:
         lb_last_pure_winner = self._winners_in_order(lb_last_pure_matches)[0]
 
         if wb_final_loser is None:
-            # can happen with extreme BYE scenarios; treat LB winner as champ contender
             wb_final_loser = lb_last_pure_winner
 
         if not has_round("L", lb_last_cross):
-            # LB champ match: LB winner vs WB final loser
             await self._safe_create_match(
                 event_id=event_id,
                 bracket="L",
@@ -449,7 +552,6 @@ class BracketService:
             return
         lb_champ = self._winners_in_order(lb_final)[0]
 
-        # Create GF match if not exists
         if not has_round("GF", 1):
             await self._safe_create_match(
                 event_id=event_id,
@@ -462,7 +564,6 @@ class BracketService:
             )
             matches = await self._repo.list_matches(event_id=event_id)
 
-        # If GF1 completed and LB champ won, create reset GF2 if not exists
         gf_round = self._group(matches, "GF", 1)
         gf1 = next((m for m in gf_round if int(m["match_no"]) == 1), None)
         gf2 = next((m for m in gf_round if int(m["match_no"]) == 2), None)
@@ -509,9 +610,6 @@ class BracketService:
             i += 2
 
     def _zip_cross(self, left: list[int], right: list[int]) -> list[tuple[int, Optional[int]]]:
-        """
-        Cross-round pairing: pair left[i] vs right[i]. If mismatch, pad with BYEs.
-        """
         out: list[tuple[int, Optional[int]]] = []
         m = max(len(left), len(right))
         for i in range(m):
@@ -520,7 +618,6 @@ class BracketService:
             if t1 is None and t2 is None:
                 continue
             if t1 is None:
-                # swap so t1 is never None
                 t1, t2 = t2, None
             out.append((t1, t2))
         return out

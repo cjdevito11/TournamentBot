@@ -108,22 +108,39 @@ class LeaderboardView:
         title: str = "Leaderboard",
         max_rows: int = 16,
         name_width: int = 22,
+        show_seed: bool = True,
     ) -> str:
         data = list(rows)[:max_rows]
 
         idx_w = 3
+        seed_w = 5  # e.g. "[12]"
         name_w = max(name_width, min(30, max((len(str(r.get("team_name") or "")) for r in data), default=name_width)))
         num_w = 4
 
         lines: list[str] = []
         lines.append(f"=== {title} (Teams) ===")
-        lines.append(f"{_pad('#', idx_w)} {_pad('Team', name_w)} {_pad('W', num_w)} {_pad('L', num_w)}")
-        lines.append("-" * (idx_w + 1 + name_w + 1 + num_w + 1 + num_w))
+
+        if show_seed:
+            lines.append(
+                f"{_pad('#', idx_w)} {_pad('Seed', seed_w)} {_pad('Team', name_w)} {_pad('W', num_w)} {_pad('L', num_w)}"
+            )
+            lines.append("-" * (idx_w + 1 + seed_w + 1 + name_w + 1 + num_w + 1 + num_w))
+        else:
+            lines.append(f"{_pad('#', idx_w)} {_pad('Team', name_w)} {_pad('W', num_w)} {_pad('L', num_w)}")
+            lines.append("-" * (idx_w + 1 + name_w + 1 + num_w + 1 + num_w))
 
         for i, r in enumerate(data, start=1):
             name = str(r.get("team_name") or f"team:{r.get('event_team_id')}")
             w = _safe_int(r.get("wins"))
             l = _safe_int(r.get("losses"))
-            lines.append(f"{_pad(str(i), idx_w)} {_pad(name, name_w)} {_pad(str(w), num_w)} {_pad(str(l), num_w)}")
+
+            if show_seed:
+                seed = r.get("seed")
+                seed_txt = f"[{_safe_int(seed)}]" if seed is not None else "[?]"
+                lines.append(
+                    f"{_pad(str(i), idx_w)} {_pad(seed_txt, seed_w)} {_pad(name, name_w)} {_pad(str(w), num_w)} {_pad(str(l), num_w)}"
+                )
+            else:
+                lines.append(f"{_pad(str(i), idx_w)} {_pad(name, name_w)} {_pad(str(w), num_w)} {_pad(str(l), num_w)}")
 
         return "```text\n" + "\n".join(lines).rstrip() + "\n```"

@@ -62,6 +62,55 @@ class StatsService:
     # Reporting
     # -------------------------
 
+    async def report_match_by_code(
+        self,
+        *,
+        event_id: int,
+        match_code: str,
+        winner_seed: int,
+        reported_by_account_id: Optional[int] = None,
+        player_stats: Sequence[PlayerStatInput] | None = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> int:
+        """
+        Resolves (event_id + match_code) -> event_match_id
+        Resolves (event_id + winner_seed) -> winner_event_team_id
+        Then calls report_match(...) which remains the transactional source of truth.
+
+        Returns event_id for convenience (same as report_match).
+        """
+        # match lookup (by event + bracket/round/match_no)
+        from services.bracket_service import parse_match_code  # module-level helper in your bracket_service.py
+
+        bracket, round_no, match_no = parse_match_code(match_code)
+
+        m = await self._event_repo.fetch_one(
+            """
+            SELECT event_match_id, team1_event_team_id, team2_event_team_id
+            FROM event_match
+            WHERE event_id=%s AND bracket=%s AND round_no=%s AND match_no=%s
+            LIMIT 1;
+            """,
+            (int(event_id), bracket, int(round_no), int(match_no)),
+        )
+        if not m:
+            raise MatchNotFoundError(f"Match not found for event {event_id}: {match_code}")
+
+        winner_row = await self._event_repo.fetch_one(
+            "SELECT event_team_id FROM event_team WHERE event_id=%s AND seed=%s LIMIT 1;",
+            (int(event_id), int(winner_seed)),
+        )
+        if not winner_row:
+            raise MatchStateError(f"Winner seed {winner_seed} does not exist for event {event_id}.")
+
+        return await self.report_match(
+            event_match_id=int(m["event_match_id"]),
+            winner_event_team_id=int(winner_row["event_team_id"]),
+            reported_by_account_id=reported_by_account_id,
+            player_stats=player_stats,
+            metadata=metadata,
+        )
+
     async def report_match(
         self,
         *,

@@ -19,6 +19,7 @@ class EmbedTheme:
 class Embeds:
     """
     Centralized embed styling so every command looks consistent.
+    Also includes small helpers for consistent "how to use" hints.
     """
 
     def __init__(self, *, theme: EmbedTheme | None = None, footer: str = "D2 Hustlers") -> None:
@@ -65,12 +66,71 @@ class Embeds:
         embed.add_field(name=name, value=value, inline=inline)
         return embed
 
+    # -------------------------
+    # Formatting helpers
+    # -------------------------
+
     def small_code(self, text: str, lang: str = "") -> str:
         lang = (lang or "").strip()
         return f"```{lang}\n{text}\n```"
+
+    def cmd(self, text: str) -> str:
+        """
+        Formats a command inline consistently.
+        """
+        t = (text or "").strip()
+        return f"`{t}`" if t else "``"
 
     def mention_user(self, user_id: int) -> str:
         return f"<@{int(user_id)}>"
 
     def mention_channel(self, channel_id: int) -> str:
         return f"<#{int(channel_id)}>"
+
+    # -------------------------
+    # Tournament hint helpers
+    # -------------------------
+
+    def report_syntax(
+        self,
+        *,
+        event_id: int | None = None,
+        match_code: str = "W1-01",
+        winner_seed: int = 1,
+    ) -> str:
+        """
+        Canonical reporting syntax (seed-based).
+        Example:
+          /event report event_id:1 match_code:W1-01 winner_seed:3
+        """
+        eid = "EVENT_ID" if event_id is None else str(int(event_id))
+        return f"/event report event_id:{eid} match_code:{match_code} winner_seed:{int(winner_seed)}"
+
+    def add_report_hint(
+        self,
+        embed: discord.Embed,
+        *,
+        event_id: int | None = None,
+        example_match_code: str = "W1-01",
+        example_winner_seed: int = 1,
+        inline: bool = False,
+    ) -> discord.Embed:
+        """
+        Adds a single standardized field telling users how to report results.
+        Use this in:
+          - /event bracket output embed
+          - post-bracket-creation confirmation
+          - error embeds when report input is invalid
+        """
+        syntax = self.report_syntax(
+            event_id=event_id,
+            match_code=example_match_code,
+            winner_seed=example_winner_seed,
+        )
+
+        value = (
+            f"{self.cmd(syntax)}\n"
+            f"Match codes look like `{example_match_code}` (W/L rounds) or `GF-01` (Grand Finals)."
+        )
+        embed.add_field(name="Report result", value=value, inline=inline)
+        return embed

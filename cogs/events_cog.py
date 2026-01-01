@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import random
+from io import BytesIO
 from typing import Any, Mapping, Optional
 
 import discord
@@ -16,6 +17,7 @@ from services.stats_service import StatsService
 from renderers.embeds import Embeds
 from renderers.bracket_view import BracketView
 from renderers.leaderboard_view import LeaderboardView, LeaderboardOptions
+from renderers.bracket_diagram import BracketDiagramRenderer
 
 
 def _json_obj(v: Any) -> dict:
@@ -34,6 +36,16 @@ def _json_obj(v: Any) -> dict:
 class EventsCog(commands.Cog):
     event = app_commands.Group(name="event", description="Create and run tournaments / events.")
 
+    # Roles allowed to manage event registrations (case-insensitive role name match)
+    MANAGER_ROLE_NAMES = {
+        "iron wolf",
+        "council",
+        "overseer",
+        "prime evils",
+        "the prime evils",
+        "event coordinator",
+    }
+
     def __init__(
         self,
         bot: commands.Bot,
@@ -45,6 +57,7 @@ class EventsCog(commands.Cog):
         embeds: Embeds,
         bracket_view: BracketView,
         leaderboard_view: LeaderboardView,
+        bracket_diagram: BracketDiagramRenderer,
     ) -> None:
         self.bot = bot
         self.identity_repo = identity_repo
@@ -54,6 +67,7 @@ class EventsCog(commands.Cog):
         self.embeds = embeds
         self.bracket_view = bracket_view
         self.leaderboard_view = leaderboard_view
+        self.bracket_diagram = bracket_diagram
 
     # -----------------------------
     # Helpers
@@ -70,11 +84,30 @@ class EventsCog(commands.Cog):
         )
 
     async def _ensure_account_id(self, member: discord.abc.User) -> int:
+        """
+        Stores a display name that includes BOTH nickname + username where possible.
+        This makes team names / brackets more recognizable.
+        """
+        username = getattr(member, "name", None) or "unknown"
+        nickname = getattr(member, "display_name", None) or username
+
+        # If nickname differs from username, keep both.
+        if nickname and username and nickname != username:
+            combined = f"{nickname} (@{username})"
+        else:
+            combined = nickname or username
+
+        combined = str(combined)[:128]
+
         return await self.identity_repo.upsert_discord_account(
             discord_user_id=member.id,
-            display_name=getattr(member, "display_name", None) or getattr(member, "name", None),
+            display_name=combined,
             is_bot=getattr(member, "bot", None),
-            metadata={"source": "discord"},
+            metadata={
+                "source": "discord",
+                "discord_username": str(username),
+                "discord_nickname": str(nickname),
+            },
         )
 
     async def _get_guild_announce_channel_internal_id(self, guild_channel_id: int) -> Optional[int]:
@@ -88,11 +121,18 @@ class EventsCog(commands.Cog):
         except Exception:
             return None
 
+    def _has_manager_role(self, member: discord.Member) -> bool:
+        want = {n.lower() for n in self.MANAGER_ROLE_NAMES}
+        return any((r.name or "").lower() in want for r in getattr(member, "roles", []))
+
     async def _can_manage(self, interaction: discord.Interaction) -> bool:
         if not interaction.guild:
             return False
         if isinstance(interaction.user, discord.Member):
-            return interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.manage_channels
+            perms = interaction.user.guild_permissions
+            if perms.manage_guild or perms.manage_channels:
+                return True
+            return self._has_manager_role(interaction.user)
         return False
 
     # -----------------------------
@@ -150,7 +190,16 @@ class EventsCog(commands.Cog):
 
         e = self.embeds.success(
             title="Event created",
-            description=f"**ID:** `{event_id}`\n**Name:** {name}\n**Format:** {format.value}\n**Team size:** {team_size}v{team_size}\n**Max players:** {max_players}",
+            description=(
+                f"**ID:** `{event_id}`\n"
+                f"**Name:** {name}\n"
+                f"**Format:** {format.value}\n"
+                f"**Team size:** {team_size}v{team_size}\n"
+                f"**Max players:** {max_players}\n\n"
+                f"Next:\n"
+                f"- `/event open {event_id}`\n"
+                f"- `/event registrations {event_id}`"
+            ),
         )
         await interaction.followup.send(embed=e)
 
@@ -181,7 +230,10 @@ class EventsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         ev = await self.event_repo.get_event(event_id=event_id)
         if not ev:
-            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."), ephemeral=True)
+            await interaction.followup.send(
+                embed=self.embeds.error(title="Not found", description="Event not found."),
+                ephemeral=True,
+            )
             return
 
         e = self.embeds.info(title=f"Event {event_id}: {ev.get('name')}")
@@ -230,6 +282,173 @@ class EventsCog(commands.Cog):
             e = self.embeds.success(title="Dropped", description=f"You have been dropped from event `{event_id}`.")
         await interaction.followup.send(embed=e, ephemeral=True)
 
+    @event.command(name="add_player", description="Manager: add a member to an event registration.")
+    @app_commands.describe(event_id="Event ID", member="Member to register")
+    async def add_player(self, interaction: discord.Interaction, event_id: int, member: discord.Member) -> None:
+        if not await self._can_manage(interaction):
+            await interaction.response.send_message("You don’t have permission to manage registrations here.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."), ephemeral=True)
+            return
+
+        status = str(ev.get("status") or "").lower()
+        if status not in ("draft", "open", "locked"):
+            await interaction.followup.send(
+                embed=self.embeds.warning(
+                    title="Event not editable",
+                    description=f"Event is `{status}`. Registrations are typically edited in draft/open/locked only.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        acct_id = await self._ensure_account_id(member)
+        await self.event_repo.register_player(
+            event_id=event_id,
+            account_id=acct_id,
+            metadata={"discord_user_id": str(member.id), "added_by_discord_user_id": str(interaction.user.id)},
+        )
+
+        await interaction.followup.send(
+            embed=self.embeds.success(title="Player added", description=f"Registered {member.mention} for event `{event_id}`."),
+            ephemeral=True,
+        )
+
+    @event.command(name="remove_player", description="Manager: remove a member from an event registration.")
+    @app_commands.describe(event_id="Event ID", member="Member to drop")
+    async def remove_player(self, interaction: discord.Interaction, event_id: int, member: discord.Member) -> None:
+        if not await self._can_manage(interaction):
+            await interaction.response.send_message("You don’t have permission to manage registrations here.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."), ephemeral=True)
+            return
+
+        status = str(ev.get("status") or "").lower()
+        if status not in ("draft", "open", "locked"):
+            await interaction.followup.send(
+                embed=self.embeds.warning(
+                    title="Event not editable",
+                    description=f"Event is `{status}`. Registrations are typically edited in draft/open/locked only.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        acct_id = await self._ensure_account_id(member)
+        n = await self.event_repo.drop_player(event_id=event_id, account_id=acct_id)
+
+        if n <= 0:
+            await interaction.followup.send(
+                embed=self.embeds.warning(
+                    title="No change",
+                    description=f"{member.mention} wasn’t active in event `{event_id}` (or already dropped).",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=self.embeds.success(title="Player removed", description=f"Dropped {member.mention} from event `{event_id}`."),
+            ephemeral=True,
+        )
+
+    @event.command(name="registrations", description="List current registrations for an event.")
+    async def registrations(self, interaction: discord.Interaction, event_id: int) -> None:
+        await interaction.response.defer(ephemeral=False)
+
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."))
+            return
+
+        regs = await self.event_repo.list_registrations(event_id=event_id)
+        if not regs:
+            await interaction.followup.send(embed=self.embeds.warning(title="No registrations", description="Nobody has registered yet."))
+            return
+
+        lines: list[str] = []
+        lines.append(f"=== Event {event_id} Registrations ===")
+        lines.append(f"Status: {str(ev.get('status') or '').lower()}")
+        lines.append("")
+        for i, r in enumerate(regs, start=1):
+            name = str(r.get("display_name") or f"acct:{r.get('account_id')}")
+            status = str(r.get("status") or "")
+            lines.append(f"{i:02d}. {name}  [{status}]")
+
+        await interaction.followup.send("```text\n" + "\n".join(lines).rstrip() + "\n```")
+
+    @event.command(name="add_fake_registrations", description="Manager: add fake registrations to test scale.")
+    @app_commands.describe(
+        event_id="Event ID",
+        count="How many fake players to add",
+        name_prefix="Prefix for fake names",
+    )
+    async def add_fake_registrations(
+        self,
+        interaction: discord.Interaction,
+        event_id: int,
+        count: app_commands.Range[int, 1, 200],
+        name_prefix: str = "FAKE",
+    ) -> None:
+        if not await self._can_manage(interaction):
+            await interaction.response.send_message("You don’t have permission to manage registrations here.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."), ephemeral=True)
+            return
+
+        status = str(ev.get("status") or "").lower()
+        if status not in ("draft", "open", "locked"):
+            await interaction.followup.send(
+                embed=self.embeds.warning(
+                    title="Event not editable",
+                    description=f"Event is `{status}`. Fake registrations are typically added in draft/open/locked only.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        added = 0
+        base_fake_id = 99_000_000_000_000_000  # high range to avoid real Discord IDs in your dev DB
+
+        for _ in range(int(count)):
+            # make a stable-ish unique fake discord id
+            fake_discord_id = base_fake_id + random.randint(1, 9_999_999_999)
+
+            fake_name = f"{name_prefix}_{fake_discord_id % 100000:05d}"
+            acct_id = await self.identity_repo.upsert_discord_account(
+                discord_user_id=int(fake_discord_id),
+                display_name=str(fake_name)[:128],
+                is_bot=True,
+                metadata={"source": "fake", "generated_by": str(interaction.user.id)},
+            )
+
+            await self.event_repo.register_player(
+                event_id=event_id,
+                account_id=int(acct_id),
+                metadata={"fake": True, "generated_by_discord_user_id": str(interaction.user.id)},
+            )
+            added += 1
+
+        await interaction.followup.send(
+            embed=self.embeds.success(
+                title="Fake registrations added",
+                description=f"Added **{added}** fake players to event `{event_id}`.\nUse `/event registrations {event_id}` to verify.",
+            ),
+            ephemeral=True,
+        )
+
     @event.command(name="randomize_teams", description="Randomize teams from registrations and create event_team records.")
     async def randomize_teams(self, interaction: discord.Interaction, event_id: int) -> None:
         if not await self._can_manage(interaction):
@@ -244,7 +463,7 @@ class EventsCog(commands.Cog):
 
         status = str(ev.get("status") or "").lower()
         if status not in ("open", "locked", "draft"):
-            await interaction.followup.send(embed=self.embeds.warning(title="Invalid state", description=f"Event is `{status}`."))  # public
+            await interaction.followup.send(embed=self.embeds.warning(title="Invalid state", description=f"Event is `{status}`."))
             return
 
         existing = await self.event_repo.list_event_teams(event_id=event_id)
@@ -277,7 +496,6 @@ class EventsCog(commands.Cog):
 
         random.shuffle(active)
 
-        # Create teams
         created_team_ids: list[int] = []
         team_no = 1
         for i in range(0, len(active), team_size):
@@ -344,39 +562,24 @@ class EventsCog(commands.Cog):
 
         text = self.bracket_view.render(matches=matches, teams=teams, title=f"Event {event_id} Bracket")
 
-        e = self.embeds.info(title=f"Event {event_id} Bracket", description="Current bracket snapshot.")
+        e = self.embeds.info(
+            title=f"Event {event_id} Bracket",
+            description=(
+                "Report results using:\n"
+                f"`/event report event_id:{event_id} match_code:W1-01 winner_seed:1`\n"
+                "Match codes are shown in the bracket output."
+            ),
+        )
         await interaction.followup.send(embed=e)
         await interaction.followup.send(content=text)
 
-        # Reporting guidance (simple + copy/paste friendly)
-        await interaction.followup.send(
-            embed=self.embeds.info(
-                title="Reporting results",
-                description=(
-                    "Use the match code and the winner seed shown in the bracket.\n\n"
-                    f"Example:\n"
-                    f"`/event report event_id:{event_id} match_code:W1-02 winner_seed:3`\n\n"
-                    "Notes:\n"
-                    "- `match_code` looks like `W1-02` or `L1-01` (exactly as shown)\n"
-                    "- `winner_seed` is the number inside `[ ]` next to the winning team"
-                ),
-            )
-        )
-
-
-    @event.command(name="report", description="Report a match winner (by bracket code + seed) and advance bracket.")
+    @event.command(name="report", description="Report a match winner (and advance bracket).")
     @app_commands.describe(
         event_id="Event ID",
-        match_code="Bracket match code shown in /event bracket (ex: W1-02, L1-01, GF-01)",
-        winner_seed="Winner seed shown in brackets (the number inside [ ]). Example: 3",
+        match_code="Match code: W1-01, L2-03, GF-01",
+        winner_seed="Winner seed number (from bracket lines: [seed])",
     )
-    async def report(
-        self,
-        interaction: discord.Interaction,
-        event_id: int,
-        match_code: str,
-        winner_seed: app_commands.Range[int, 1, 9999],
-    ) -> None:
+    async def report(self, interaction: discord.Interaction, event_id: int, match_code: str, winner_seed: int) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
@@ -384,89 +587,39 @@ class EventsCog(commands.Cog):
 
         reporter = await self._ensure_account_id(interaction.user)
 
-        # Resolve match from event_id + match_code (W1-02 style)
         m = await self.event_repo.get_match_by_code(event_id=event_id, match_code=match_code)
         if not m:
             await interaction.followup.send(
                 embed=self.embeds.error(
-                    title="Match not found",
-                    description="Could not find that match code for this event.\n"
-                                "Use `/event bracket <event_id>` and copy a code like `W1-02`.",
+                    title="Report failed",
+                    description="Match not found. Use a code like `W1-01`, `L2-03`, or `GF-01`.",
                 )
             )
             return
 
-        if str(m.get("status") or "").lower() == "completed":
-            await interaction.followup.send(
-                embed=self.embeds.warning(
-                    title="Already completed",
-                    description=f"Match `{match_code.upper()}` is already completed for event `{event_id}`.",
-                )
-            )
-            return
-
-        team1_id = int(m["team1_event_team_id"])
-        team2_raw = m.get("team2_event_team_id")
-        team2_id = int(team2_raw) if team2_raw is not None else None
-
-        if team2_id is None:
-            await interaction.followup.send(
-                embed=self.embeds.warning(
-                    title="BYE match",
-                    description=f"Match `{match_code.upper()}` is a BYE. No report needed.",
-                )
-            )
-            return
-
-        # Map team_id -> seed (so user can report by winner_seed)
-        teams = await self.event_repo.list_event_teams(event_id=event_id)
-        seed_by_team: dict[int, int] = {}
-        name_by_team: dict[int, str] = {}
-
-        for t in teams:
-            tid = int(t["event_team_id"])
-            name_by_team[tid] = str(t.get("display_name") or f"Team {tid}")
-            if t.get("seed") is not None:
-                try:
-                    seed_by_team[tid] = int(t["seed"])
-                except Exception:
-                    pass
-
-        s1 = seed_by_team.get(team1_id)
-        s2 = seed_by_team.get(team2_id)
-
-        if s1 is None or s2 is None:
+        row = await self.event_repo.fetch_one(
+            "SELECT event_team_id FROM event_team WHERE event_id=%s AND seed=%s;",
+            (int(event_id), int(winner_seed)),
+        )
+        if not row:
             await interaction.followup.send(
                 embed=self.embeds.error(
-                    title="Seed mapping missing",
-                    description="This match does not have seeds assigned to both teams.\n"
-                                "Make sure you created event teams with seeds (your randomize step does this).",
+                    title="Report failed",
+                    description=f"Winner seed `{winner_seed}` not found for event `{event_id}`.",
                 )
             )
             return
 
-        if int(winner_seed) not in (s1, s2):
-            await interaction.followup.send(
-                embed=self.embeds.warning(
-                    title="Invalid winner_seed",
-                    description=(
-                        f"For match `{match_code.upper()}`, winner_seed must be `{s1}` or `{s2}`.\n"
-                        f"Teams: `[${s1}] {name_by_team.get(team1_id, str(team1_id))}` vs "
-                        f"`[{s2}] {name_by_team.get(team2_id, str(team2_id))}`"
-                    ).replace("[$", "["),  # tiny safety to keep formatting intact
-                )
-            )
-            return
-
-        winner_team_id = team1_id if int(winner_seed) == s1 else team2_id
+        winner_event_team_id = int(row["event_team_id"])
+        match_id = int(m["event_match_id"])
 
         try:
-            updated_event_id = await self.stats.report_match(
-                event_match_id=int(m["event_match_id"]),
-                winner_event_team_id=int(winner_team_id),
+            _ = await self.stats.report_match(
+                event_match_id=match_id,
+                winner_event_team_id=winner_event_team_id,
                 reported_by_account_id=reporter,
                 player_stats=None,
-                metadata={"source": "discord", "match_code": match_code.upper(), "winner_seed": int(winner_seed)},
+                metadata={"source": "discord", "match_code": str(match_code).upper(), "winner_seed": int(winner_seed)},
             )
         except Exception as ex:
             await interaction.followup.send(embed=self.embeds.error(title="Report failed", description=str(ex)))
@@ -476,13 +629,48 @@ class EventsCog(commands.Cog):
             embed=self.embeds.success(
                 title="Match recorded",
                 description=(
-                    f"Recorded `{match_code.upper()}` winner as seed `[{int(winner_seed)}]`.\n"
-                    f"Bracket advanced for event `{updated_event_id}`.\n"
-                    f"Use `/event bracket {updated_event_id}` to view."
+                    f"Recorded `{str(match_code).upper()}` winner seed `{winner_seed}`.\n"
+                    f"Use `/event bracket {event_id}` or `/event bracket_image {event_id}`."
                 ),
             )
         )
 
+    @event.command(name="bracket_image", description="Show the current bracket as a drawn PNG.")
+    async def bracket_image(self, interaction: discord.Interaction, event_id: int) -> None:
+        await interaction.response.defer(ephemeral=False)
+
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."))
+            return
+
+        teams = await self.event_repo.list_event_teams(event_id=event_id)
+        matches = await self.event_repo.list_matches(event_id=event_id)
+
+        if not teams:
+            await interaction.followup.send(embed=self.embeds.warning(title="No teams", description="No event teams found yet."))
+            return
+
+        teams_by_seed: dict[int, dict[str, Any]] = {}
+        for t in teams:
+            seed = t.get("seed")
+            if seed is None:
+                continue
+            teams_by_seed[int(seed)] = {
+                "event_team_id": int(t["event_team_id"]),
+                "display_name": t.get("display_name") or f"Team {seed}",
+            }
+
+        png = self.bracket_diagram.render_png(
+            event_id=event_id,
+            event_format=str(ev.get("format") or "double_elim"),
+            teams_by_seed=teams_by_seed,
+            matches=list(matches or []),
+            title=f"Event {event_id} Bracket",
+        )
+
+        fp = BytesIO(png)
+        await interaction.followup.send(file=discord.File(fp, filename=f"event_{event_id}_bracket.png"))
 
     @event.command(name="leaderboard", description="Show event leaderboard (players + teams).")
     async def leaderboard(self, interaction: discord.Interaction, event_id: int) -> None:
@@ -517,6 +705,7 @@ async def setup(
     embeds: Embeds,
     bracket_view: BracketView,
     leaderboard_view: LeaderboardView,
+    bracket_diagram: BracketDiagramRenderer,
 ) -> None:
     await bot.add_cog(
         EventsCog(
@@ -528,5 +717,6 @@ async def setup(
             embeds=embeds,
             bracket_view=bracket_view,
             leaderboard_view=leaderboard_view,
+            bracket_diagram=bracket_diagram,
         )
     )

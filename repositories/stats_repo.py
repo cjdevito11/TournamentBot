@@ -77,12 +77,14 @@ class StatsRepo(BaseRepo):
     async def event_team_records(self, *, event_id: int) -> list[Mapping[str, Any]]:
         """
         Computes team W/L for the event based on completed matches.
+        Includes seed for human-friendly reporting alignment.
         """
         return await self.fetch_all(
             """
             SELECT
               et.event_team_id,
-              COALESCE(et.display_name, CONCAT('Team ', et.event_team_id)) AS team_name,
+              et.seed,
+              COALESCE(et.display_name, CONCAT('Seed ', COALESCE(et.seed, et.event_team_id))) AS team_name,
 
               SUM(CASE WHEN m.status='completed' AND m.winner_event_team_id = et.event_team_id THEN 1 ELSE 0 END) AS wins,
               SUM(CASE WHEN m.status='completed' AND m.loser_event_team_id  = et.event_team_id THEN 1 ELSE 0 END) AS losses
@@ -92,8 +94,9 @@ class StatsRepo(BaseRepo):
              AND m.status = 'completed'
              AND (m.winner_event_team_id = et.event_team_id OR m.loser_event_team_id = et.event_team_id)
             WHERE et.event_id=%s
-            GROUP BY et.event_team_id, team_name
-            ORDER BY wins DESC, losses ASC, team_name ASC;
+            GROUP BY et.event_team_id, et.seed, team_name
+            ORDER BY wins DESC, losses ASC, et.seed IS NULL, et.seed ASC, team_name ASC;
             """,
             (event_id,),
         )
+
