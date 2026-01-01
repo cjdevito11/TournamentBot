@@ -24,6 +24,7 @@ from services.stats_service import StatsService
 from renderers.embeds import Embeds
 from renderers.bracket_view import BracketView
 from renderers.leaderboard_view import LeaderboardView
+from renderers.bracket_diagram import BracketDiagramRenderer  # <-- ADD
 
 from cogs.admin_cog import setup as setup_admin_cog
 from cogs.events_cog import setup as setup_events_cog
@@ -68,6 +69,7 @@ class D2HBot(commands.Bot):
         embeds = Embeds()
         bracket_view = BracketView()
         leaderboard_view = LeaderboardView()
+        bracket_diagram = BracketDiagramRenderer()  # <-- ADD
 
         # --- Cogs ---
         await setup_admin_cog(self, identity_repo=identity_repo, embeds=embeds)
@@ -80,6 +82,7 @@ class D2HBot(commands.Bot):
             embeds=embeds,
             bracket_view=bracket_view,
             leaderboard_view=leaderboard_view,
+            bracket_diagram=bracket_diagram,  # <-- ADD
         )
         await setup_ladder_cog(self, identity_repo=identity_repo, team_repo=team_repo, embeds=embeds)
 
