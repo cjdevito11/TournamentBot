@@ -73,6 +73,97 @@ class EventsCog(commands.Cog):
     # Helpers
     # -----------------------------
 
+    async def _render_bracket_png_bytes(self, event_id: int) -> Optional[bytes]:
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            return None
+
+        teams = await self.event_repo.list_event_teams(event_id=event_id)
+        matches = await self.event_repo.list_matches(event_id=event_id)
+        if not teams:
+            return None
+
+        teams_by_seed: dict[int, dict[str, Any]] = {}
+        for t in teams:
+            seed = t.get("seed")
+            if seed is None:
+                continue
+            teams_by_seed[int(seed)] = {
+                "event_team_id": int(t["event_team_id"]),
+                "display_name": t.get("display_name") or f"Team {seed}",
+            }
+
+        png = self.bracket_diagram.render_png(
+            event_id=event_id,
+            event_format=str(ev.get("format") or "double_elim"),
+            teams_by_seed=teams_by_seed,
+            matches=list(matches or []),
+            title=f"Event {event_id} Bracket",
+        )
+        return png
+
+    async def _save_bracket_image_message_ref(self, event_id: int, channel_id: int, message_id: int) -> None:
+        """
+        Stores the message reference in event.metadata so we can edit the same message next time.
+        Assumes `event.metadata` is a JSON column.
+        """
+        # NOTE: adjust table/column names if your schema differs.
+        sql = """
+        UPDATE event
+        SET metadata = JSON_SET(
+            COALESCE(metadata, JSON_OBJECT()),
+            '$.bracket_image_channel_id', CAST(%s AS JSON),
+            '$.bracket_image_message_id', CAST(%s AS JSON)
+        )
+        WHERE event_id = %s;
+        """
+        # You need an execute method on event_repo. If yours is named differently, swap here.
+        await self.event_repo.execute(sql, (int(channel_id), int(message_id), int(event_id)))
+
+    async def _upsert_bracket_image_post(self, event_id: int, channel: discord.TextChannel) -> Optional[discord.Message]:
+        """
+        Edit the prior bracket image post if known; otherwise create it and persist IDs in event.metadata.
+        """
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            return None
+
+        png = await self._render_bracket_png_bytes(event_id)
+        if not png:
+            return None
+
+        md = _json_obj(ev.get("metadata"))
+        prior_channel_id = md.get("bracket_image_channel_id")
+        prior_message_id = md.get("bracket_image_message_id")
+
+        target_channel: discord.abc.MessageableChannel = channel
+        if prior_channel_id:
+            ch = self.bot.get_channel(int(prior_channel_id))
+            if isinstance(ch, discord.TextChannel):
+                target_channel = ch
+
+        file_obj = discord.File(BytesIO(png), filename=f"event_{event_id}_bracket.png")
+        content = f"**Event {event_id} Bracket** (auto-updated)"
+
+        # Try edit-in-place if we have IDs
+        if prior_channel_id and prior_message_id and isinstance(target_channel, discord.TextChannel):
+            try:
+                msg = await target_channel.fetch_message(int(prior_message_id))
+                # discord.py v2 uses attachments=[...] when editing files
+                await msg.edit(content=content, attachments=[file_obj])
+                return msg
+            except Exception:
+                # If fetch/edit fails (deleted message, missing perms, etc.), fall through to posting new.
+                pass
+
+        # Post a new message and persist reference
+        if isinstance(target_channel, discord.TextChannel):
+            msg = await target_channel.send(content=content, file=file_obj)
+            await self._save_bracket_image_message_ref(event_id, target_channel.id, msg.id)
+            return msg
+
+        return None
+
     async def _ensure_guild_channel_id(self, guild: discord.Guild) -> int:
         return await self.identity_repo.ensure_discord_guild(guild_id=guild.id, guild_name=guild.name)
 
@@ -546,6 +637,10 @@ class EventsCog(commands.Cog):
 
         await self.event_repo.set_event_status(event_id=event_id, status="active")
         await interaction.followup.send(embed=self.embeds.success(title="Bracket created", description=f"Bracket generated for event `{event_id}`."))
+        # Optionally auto-post the initial bracket image immediately
+        if isinstance(interaction.channel, discord.TextChannel):
+            await self._upsert_bracket_image_post(event_id, interaction.channel)
+
 
     @event.command(name="bracket", description="Show the current bracket.")
     async def bracket(self, interaction: discord.Interaction, event_id: int) -> None:
@@ -630,10 +725,14 @@ class EventsCog(commands.Cog):
                 title="Match recorded",
                 description=(
                     f"Recorded `{str(match_code).upper()}` winner seed `{winner_seed}`.\n"
-                    f"Use `/event bracket {event_id}` or `/event bracket_image {event_id}`."
+                    f"Bracket image will be updated automatically."
                 ),
             )
         )
+
+        # Auto-regenerate bracket image after each report
+        if isinstance(interaction.channel, discord.TextChannel):
+            await self._upsert_bracket_image_post(event_id, interaction.channel)
 
     @event.command(name="bracket_image", description="Show the current bracket as a drawn PNG.")
     async def bracket_image(self, interaction: discord.Interaction, event_id: int) -> None:
