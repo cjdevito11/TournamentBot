@@ -265,5 +265,5 @@ class EventRepo(BaseRepo):
             (event_id,),
         )
 
-    async def execute(self, sql: str, params: tuple = ()) -> int:
-        return await self.db.execute(sql, params)
+    #async def execute(self, sql: str, params: tuple = ()) -> int:
+        #return await self._db.execute(sql, params)

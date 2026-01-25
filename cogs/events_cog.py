@@ -1,14 +1,21 @@
 # cogs/events_cog.py
 from __future__ import annotations
 
+import os
 import json
 import random
-from io import BytesIO
-from typing import Any, Mapping, Optional
+import time
+import asyncio
+
+
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+from pathlib import Path
+from io import BytesIO
+from typing import Any, Mapping, Optional
 
 from repositories.identity_repo import IdentityRepo
 from repositories.event_repo import EventRepo
@@ -18,6 +25,7 @@ from renderers.embeds import Embeds
 from renderers.bracket_view import BracketView
 from renderers.leaderboard_view import LeaderboardView, LeaderboardOptions
 from renderers.bracket_diagram import BracketDiagramRenderer
+from renderers.spin_reveal import SpinRevealRenderer
 
 
 def _json_obj(v: Any) -> dict:
@@ -35,6 +43,28 @@ def _json_obj(v: Any) -> dict:
 
 class EventsCog(commands.Cog):
     event = app_commands.Group(name="event", description="Create and run tournaments / events.")
+
+    # -----------------------------
+    # RATE LIMITS (easy knobs)
+    # -----------------------------
+    # Per-user cooldown (seconds) for heavier commands
+    RL_USER_SECONDS_HEAVY: int = 15
+
+    # Per-channel cooldown (seconds) for heavier commands (prevents pile-ups in a busy channel)
+    RL_CHANNEL_SECONDS_HEAVY: int = 10
+
+    # Per-event cooldown (seconds) for heavier commands (prevents spam regenerations for same event)
+    RL_EVENT_SECONDS_HEAVY: int = 8
+
+    # If True: managers bypass rate limits
+    RL_MANAGERS_BYPASS: bool = True
+
+    # Which commands are considered "heavy"
+    RL_HEAVY_COMMANDS: set[str] = {
+        "create_bracket",
+        "bracket_image",
+        "current_round",
+    }
 
     # Roles allowed to manage event registrations (case-insensitive role name match)
     MANAGER_ROLE_NAMES = {
@@ -69,22 +99,177 @@ class EventsCog(commands.Cog):
         self.leaderboard_view = leaderboard_view
         self.bracket_diagram = bracket_diagram
 
+        # rate-limit state (in-memory)
+        self._rl_user_last: dict[tuple[int, str], float] = {}
+        self._rl_channel_last: dict[tuple[int, str], float] = {}
+        self._rl_event_last: dict[tuple[int, int, str], float] = {}
+
     # -----------------------------
     # Helpers
     # -----------------------------
+    async def _spin_visual(
+        self,
+        *,
+        interaction: discord.Interaction,
+        title: str,
+        names: list[str],
+        frames: int = 14,
+        delay: float = 0.25,
+    ) -> None:
+        """
+        Visual hype spinner. Edits ONE message with PNG frames.
+        """
+        renderer = SpinRevealRenderer()
 
-    async def _render_bracket_png_bytes(self, event_id: int) -> Optional[bytes]:
-        ev = await self.event_repo.get_event(event_id=event_id)
-        if not ev:
-            return None
+        msg = await interaction.followup.send(
+            content="🎰 **Spinning…**",
+            wait=True,
+        )
 
+        cursor = random.randint(0, max(0, len(names) - 1))
+
+        for i in range(frames):
+            random.shuffle(names)
+            cursor = random.randint(0, max(0, len(names) - 1))
+
+            png = renderer.render_frame(
+                title=title,
+                entries=names,
+                cursor=cursor,
+                phase="Spinning…",
+            )
+
+            file = discord.File(BytesIO(png), filename="spin.png")
+            await msg.edit(attachments=[file])
+
+            await asyncio.sleep(delay)
+
+        # Final lock frame
+        png = renderer.render_frame(
+            title=title,
+            entries=names,
+            cursor=cursor,
+            phase="LOCKED",
+        )
+        file = discord.File(BytesIO(png), filename="spin_final.png")
+        await msg.edit(content="🔥 **Teams Locked**", attachments=[file])
+
+
+
+    def _load_help_text(self, filename: str, *, fallback: str = "") -> str:
+        """
+        Loads markdown/text from /data/help so you can edit help copy without touching code.
+        """
+        candidates = [
+            Path("data") / "help" / filename,  # run from repo root
+            Path(__file__).resolve().parent.parent / "data" / "help" / filename,  # cogs/ -> project/data/help
+            Path(__file__).resolve().parent / "data" / "help" / filename,  # cogs/data/help (alt)
+        ]
+        for p in candidates:
+            try:
+                if p.exists() and p.is_file():
+                    return (p.read_text(encoding="utf-8", errors="ignore") or fallback).strip()
+            except Exception:
+                continue
+        return (fallback or "Help file not found.").strip()
+
+    def _has_manager_role(self, member: discord.Member) -> bool:
+        want = {n.lower() for n in self.MANAGER_ROLE_NAMES}
+        return any((r.name or "").lower() in want for r in getattr(member, "roles", []))
+
+    async def _can_manage(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
+        if isinstance(interaction.user, discord.Member):
+            perms = interaction.user.guild_permissions
+            if perms.manage_guild or perms.manage_channels:
+                return True
+            return self._has_manager_role(interaction.user)
+        return False
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def _cooldown_left(self, last_ts: float, cooldown: int) -> int:
+        left = int(round((last_ts + cooldown) - self._now()))
+        return max(0, left)
+
+    async def _rate_limit_heavy(
+        self,
+        interaction: discord.Interaction,
+        *,
+        command_name: str,
+        event_id: Optional[int] = None,
+    ) -> bool:
+        """
+        Returns True if allowed, False if blocked (and sends a friendly message).
+        Applies user+channel+event cooldowns for heavy commands.
+        """
+        if command_name not in self.RL_HEAVY_COMMANDS:
+            return True
+
+        if self.RL_MANAGERS_BYPASS and await self._can_manage(interaction):
+            return True
+
+        user_id = int(getattr(interaction.user, "id", 0) or 0)
+        channel_id = int(getattr(interaction.channel, "id", 0) or 0)
+
+        now = self._now()
+        blocks: list[str] = []
+
+        # Per-user
+        ku = (user_id, command_name)
+        last_u = self._rl_user_last.get(ku)
+        if last_u is not None:
+            left = self._cooldown_left(last_u, self.RL_USER_SECONDS_HEAVY)
+            if left > 0:
+                blocks.append(f"user cooldown: {left}s")
+        # Per-channel
+        kc = (channel_id, command_name)
+        last_c = self._rl_channel_last.get(kc)
+        if last_c is not None:
+            left = self._cooldown_left(last_c, self.RL_CHANNEL_SECONDS_HEAVY)
+            if left > 0:
+                blocks.append(f"channel cooldown: {left}s")
+
+        # Per-event
+        if event_id is not None:
+            ke = (int(event_id), channel_id, command_name)
+            last_e = self._rl_event_last.get(ke)
+            if last_e is not None:
+                left = self._cooldown_left(last_e, self.RL_EVENT_SECONDS_HEAVY)
+                if left > 0:
+                    blocks.append(f"event cooldown: {left}s")
+
+        if blocks:
+            msg = (
+                "Slow down, hero. That command is heavy and can backlog the bot.\n"
+                f"Blocked by: **{', '.join(blocks)}**\n"
+                "Try again in a moment."
+            )
+
+            # If already deferred, use followup. Otherwise respond.
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+            return False
+
+        # Record stamps (only when allowed)
+        self._rl_user_last[ku] = now
+        self._rl_channel_last[kc] = now
+        if event_id is not None:
+            self._rl_event_last[(int(event_id), channel_id, command_name)] = now
+
+        return True
+
+    async def _build_teams_by_seed(self, event_id: int) -> dict[int, dict[str, Any]]:
         teams = await self.event_repo.list_event_teams(event_id=event_id)
-        matches = await self.event_repo.list_matches(event_id=event_id)
-        if not teams:
-            return None
-
         teams_by_seed: dict[int, dict[str, Any]] = {}
-        for t in teams:
+        for t in teams or []:
             seed = t.get("seed")
             if seed is None:
                 continue
@@ -92,6 +277,18 @@ class EventsCog(commands.Cog):
                 "event_team_id": int(t["event_team_id"]),
                 "display_name": t.get("display_name") or f"Team {seed}",
             }
+        return teams_by_seed
+
+    async def _render_bracket_png_bytes(self, event_id: int) -> Optional[bytes]:
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            return None
+
+        teams_by_seed = await self._build_teams_by_seed(event_id)
+        matches = await self.event_repo.list_matches(event_id=event_id)
+
+        if not teams_by_seed:
+            return None
 
         png = self.bracket_diagram.render_png(
             event_id=event_id,
@@ -102,12 +299,30 @@ class EventsCog(commands.Cog):
         )
         return png
 
+    async def _render_current_round_png_bytes(self, event_id: int) -> Optional[bytes]:
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            return None
+
+        teams_by_seed = await self._build_teams_by_seed(event_id)
+        matches = await self.event_repo.list_matches(event_id=event_id)
+
+        if not teams_by_seed:
+            return None
+
+        png = self.bracket_diagram.render_current_round_png(
+            event_id=event_id,
+            event_format=str(ev.get("format") or "double_elim"),
+            teams_by_seed=teams_by_seed,
+            matches=list(matches or []),
+            title=f"Event {event_id} Current Matches",
+            statuses=("open", "pending"),
+            max_cards=24,
+            cards_per_row=None,
+        )
+        return png
+
     async def _save_bracket_image_message_ref(self, event_id: int, channel_id: int, message_id: int) -> None:
-        """
-        Stores the message reference in event.metadata so we can edit the same message next time.
-        Assumes `event.metadata` is a JSON column.
-        """
-        # NOTE: adjust table/column names if your schema differs.
         sql = """
         UPDATE event
         SET metadata = JSON_SET(
@@ -117,13 +332,21 @@ class EventsCog(commands.Cog):
         )
         WHERE event_id = %s;
         """
-        # You need an execute method on event_repo. If yours is named differently, swap here.
+        await self.event_repo.execute(sql, (int(channel_id), int(message_id), int(event_id)))
+
+    async def _save_current_round_image_message_ref(self, event_id: int, channel_id: int, message_id: int) -> None:
+        sql = """
+        UPDATE event
+        SET metadata = JSON_SET(
+            COALESCE(metadata, JSON_OBJECT()),
+            '$.current_round_image_channel_id', CAST(%s AS JSON),
+            '$.current_round_image_message_id', CAST(%s AS JSON)
+        )
+        WHERE event_id = %s;
+        """
         await self.event_repo.execute(sql, (int(channel_id), int(message_id), int(event_id)))
 
     async def _upsert_bracket_image_post(self, event_id: int, channel: discord.TextChannel) -> Optional[discord.Message]:
-        """
-        Edit the prior bracket image post if known; otherwise create it and persist IDs in event.metadata.
-        """
         ev = await self.event_repo.get_event(event_id=event_id)
         if not ev:
             return None
@@ -145,21 +368,54 @@ class EventsCog(commands.Cog):
         file_obj = discord.File(BytesIO(png), filename=f"event_{event_id}_bracket.png")
         content = f"**Event {event_id} Bracket** (auto-updated)"
 
-        # Try edit-in-place if we have IDs
         if prior_channel_id and prior_message_id and isinstance(target_channel, discord.TextChannel):
             try:
                 msg = await target_channel.fetch_message(int(prior_message_id))
-                # discord.py v2 uses attachments=[...] when editing files
                 await msg.edit(content=content, attachments=[file_obj])
                 return msg
             except Exception:
-                # If fetch/edit fails (deleted message, missing perms, etc.), fall through to posting new.
                 pass
 
-        # Post a new message and persist reference
         if isinstance(target_channel, discord.TextChannel):
             msg = await target_channel.send(content=content, file=file_obj)
             await self._save_bracket_image_message_ref(event_id, target_channel.id, msg.id)
+            return msg
+
+        return None
+
+    async def _upsert_current_round_image_post(self, event_id: int, channel: discord.TextChannel) -> Optional[discord.Message]:
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            return None
+
+        png = await self._render_current_round_png_bytes(event_id)
+        if not png:
+            return None
+
+        md = _json_obj(ev.get("metadata"))
+        prior_channel_id = md.get("current_round_image_channel_id")
+        prior_message_id = md.get("current_round_image_message_id")
+
+        target_channel: discord.abc.MessageableChannel = channel
+        if prior_channel_id:
+            ch = self.bot.get_channel(int(prior_channel_id))
+            if isinstance(ch, discord.TextChannel):
+                target_channel = ch
+
+        file_obj = discord.File(BytesIO(png), filename=f"event_{event_id}_current.png")
+        content = f"**Event {event_id} Current Matches** (auto-updated)"
+
+        if prior_channel_id and prior_message_id and isinstance(target_channel, discord.TextChannel):
+            try:
+                msg = await target_channel.fetch_message(int(prior_message_id))
+                await msg.edit(content=content, attachments=[file_obj])
+                return msg
+            except Exception:
+                pass
+
+        if isinstance(target_channel, discord.TextChannel):
+            msg = await target_channel.send(content=content, file=file_obj)
+            await self._save_current_round_image_message_ref(event_id, target_channel.id, msg.id)
             return msg
 
         return None
@@ -175,14 +431,9 @@ class EventsCog(commands.Cog):
         )
 
     async def _ensure_account_id(self, member: discord.abc.User) -> int:
-        """
-        Stores a display name that includes BOTH nickname + username where possible.
-        This makes team names / brackets more recognizable.
-        """
         username = getattr(member, "name", None) or "unknown"
         nickname = getattr(member, "display_name", None) or username
 
-        # If nickname differs from username, keep both.
         if nickname and username and nickname != username:
             combined = f"{nickname} (@{username})"
         else:
@@ -212,23 +463,29 @@ class EventsCog(commands.Cog):
         except Exception:
             return None
 
-    def _has_manager_role(self, member: discord.Member) -> bool:
-        want = {n.lower() for n in self.MANAGER_ROLE_NAMES}
-        return any((r.name or "").lower() in want for r in getattr(member, "roles", []))
-
-    async def _can_manage(self, interaction: discord.Interaction) -> bool:
-        if not interaction.guild:
-            return False
-        if isinstance(interaction.user, discord.Member):
-            perms = interaction.user.guild_permissions
-            if perms.manage_guild or perms.manage_channels:
-                return True
-            return self._has_manager_role(interaction.user)
-        return False
-
     # -----------------------------
     # Commands
     # -----------------------------
+
+    @app_commands.command(name="help", description="Show bot help.")
+    async def help(self, interaction: discord.Interaction) -> None:
+        text = self._load_help_text("help.md", fallback="Help is not configured yet. Add `data/help/help.md`.")
+        if len(text) <= 1900:
+            await interaction.response.send_message(f"```md\n{text}\n```", ephemeral=True)
+            return
+        await interaction.response.send_message("```md\nHelp is long — sending in parts.\n```", ephemeral=True)
+        for chunk in [text[i : i + 1900] for i in range(0, len(text), 1900)]:
+            await interaction.followup.send(f"```md\n{chunk}\n```", ephemeral=True)
+
+    @app_commands.command(name="commands", description="Show bot commands.")
+    async def commands(self, interaction: discord.Interaction) -> None:
+        text = self._load_help_text("commands.md", fallback="Commands list is not configured yet. Add `data/help/commands.md`.")
+        if len(text) <= 1900:
+            await interaction.response.send_message(f"```md\n{text}\n```", ephemeral=True)
+            return
+        await interaction.response.send_message("```md\nCommands list is long — sending in parts.\n```", ephemeral=True)
+        for chunk in [text[i : i + 1900] for i in range(0, len(text), 1900)]:
+            await interaction.followup.send(f"```md\n{chunk}\n```", ephemeral=True)
 
     @event.command(name="create", description="Create a new event (tournament).")
     @app_commands.describe(
@@ -259,7 +516,6 @@ class EventsCog(commands.Cog):
 
         guild_channel_id = await self._ensure_guild_channel_id(interaction.guild)
 
-        # announce channel: guild setting > current channel
         announce_internal = await self._get_guild_announce_channel_internal_id(guild_channel_id)
         if announce_internal is None:
             announce_internal = await self._ensure_text_channel_id(interaction.channel, interaction.guild)
@@ -511,12 +767,10 @@ class EventsCog(commands.Cog):
             return
 
         added = 0
-        base_fake_id = 99_000_000_000_000_000  # high range to avoid real Discord IDs in your dev DB
+        base_fake_id = 99_000_000_000_000_000
 
         for _ in range(int(count)):
-            # make a stable-ish unique fake discord id
             fake_discord_id = base_fake_id + random.randint(1, 9_999_999_999)
-
             fake_name = f"{name_prefix}_{fake_discord_id % 100000:05d}"
             acct_id = await self.identity_repo.upsert_discord_account(
                 discord_user_id=int(fake_discord_id),
@@ -568,9 +822,7 @@ class EventsCog(commands.Cog):
         regs = await self.event_repo.list_registrations(event_id=event_id)
         active = [r for r in regs if str(r.get("status") or "").lower() == "active"]
         if len(active) < team_size * 2:
-            await interaction.followup.send(
-                embed=self.embeds.warning(title="Not enough players", description=f"Need at least {team_size*2} active registrations.")
-            )
+            await interaction.followup.send(embed=self.embeds.warning(title="Not enough players", description=f"Need at least {team_size*2} active registrations."))
             return
 
         if len(active) > max_players:
@@ -586,6 +838,22 @@ class EventsCog(commands.Cog):
             return
 
         random.shuffle(active)
+
+        # ---- SPIN VISUAL (HYPE MOMENT) ----
+        display_names = [
+            str(r.get("display_name") or r.get("account_id"))
+            for r in active
+        ]
+
+        await self._spin_visual(
+            interaction=interaction,
+            title="D2 Hustlers — Team Randomizer",
+            names=display_names,
+            frames=16,      # adjust safely
+            delay=0.22,     # adjust speed
+        )
+        # ---------------------------------
+
 
         created_team_ids: list[int] = []
         team_no = 1
@@ -624,9 +892,14 @@ class EventsCog(commands.Cog):
 
     @event.command(name="create_bracket", description="Generate the bracket matches from event teams.")
     async def create_bracket(self, interaction: discord.Interaction, event_id: int) -> None:
+        # rate-limit heavy command
+        if not await self._rate_limit_heavy(interaction, command_name="create_bracket", event_id=event_id):
+            return
+
         if not await self._can_manage(interaction):
             await interaction.response.send_message("Missing permission to manage events here.", ephemeral=True)
             return
+
         await interaction.response.defer(ephemeral=False)
 
         try:
@@ -637,36 +910,86 @@ class EventsCog(commands.Cog):
 
         await self.event_repo.set_event_status(event_id=event_id, status="active")
         await interaction.followup.send(embed=self.embeds.success(title="Bracket created", description=f"Bracket generated for event `{event_id}`."))
-        # Optionally auto-post the initial bracket image immediately
+
         if isinstance(interaction.channel, discord.TextChannel):
             await self._upsert_bracket_image_post(event_id, interaction.channel)
+            await self._upsert_current_round_image_post(event_id, interaction.channel)
 
+    @event.command(name="bracket_image", description="Show the current bracket as a drawn PNG.")
+    async def bracket_image(self, interaction: discord.Interaction, event_id: int) -> None:
+        # rate-limit heavy command
+        if not await self._rate_limit_heavy(interaction, command_name="bracket_image", event_id=event_id):
+            return
 
-    @event.command(name="bracket", description="Show the current bracket.")
-    async def bracket(self, interaction: discord.Interaction, event_id: int) -> None:
         await interaction.response.defer(ephemeral=False)
 
-        teams = await self.event_repo.list_event_teams(event_id=event_id)
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."))
+            return
+
+        teams_by_seed = await self._build_teams_by_seed(event_id)
         matches = await self.event_repo.list_matches(event_id=event_id)
-        if not teams:
+
+        if not teams_by_seed:
             await interaction.followup.send(embed=self.embeds.warning(title="No teams", description="No event teams found yet."))
             return
-        if not matches:
-            await interaction.followup.send(embed=self.embeds.warning(title="No matches", description="No matches generated yet."))
+
+        png = self.bracket_diagram.render_png(
+            event_id=event_id,
+            event_format=str(ev.get("format") or "double_elim"),
+            teams_by_seed=teams_by_seed,
+            matches=list(matches or []),
+            title=f"Event {event_id} Bracket",
+        )
+
+        fp = BytesIO(png)
+        await interaction.followup.send(file=discord.File(fp, filename=f"event_{event_id}_bracket.png"))
+
+    @event.command(name="current_round", description="Show current active matches as an easy-to-read image.")
+    async def current_round(self, interaction: discord.Interaction, event_id: int) -> None:
+        # rate-limit heavy command
+        if not await self._rate_limit_heavy(interaction, command_name="current_round", event_id=event_id):
             return
 
-        text = self.bracket_view.render(matches=matches, teams=teams, title=f"Event {event_id} Bracket")
+        await interaction.response.defer(ephemeral=False)
 
-        e = self.embeds.info(
-            title=f"Event {event_id} Bracket",
-            description=(
-                "Report results using:\n"
-                f"`/event report event_id:{event_id} match_code:W1-01 winner_seed:1`\n"
-                "Match codes are shown in the bracket output."
-            ),
-        )
-        await interaction.followup.send(embed=e)
-        await interaction.followup.send(content=text)
+        ev = await self.event_repo.get_event(event_id=event_id)
+        if not ev:
+            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."))
+            return
+
+        png = await self._render_current_round_png_bytes(event_id)
+        if not png:
+            await interaction.followup.send(embed=self.embeds.warning(title="Nothing to show", description="No active matches found (or no teams yet)."))
+            return
+
+        fp = BytesIO(png)
+        await interaction.followup.send(file=discord.File(fp, filename=f"event_{event_id}_current_round.png"))
+
+    # ---- keep the rest of your commands unchanged below this line ----
+
+    @event.command(name="leaderboard", description="Show event leaderboard (players + teams).")
+    async def leaderboard(self, interaction: discord.Interaction, event_id: int) -> None:
+        await interaction.response.defer(ephemeral=False)
+
+        players = await self.stats.get_player_leaderboard(event_id=event_id)
+        teams = await self.stats.get_team_records(event_id=event_id)
+
+        if not players and not teams:
+            await interaction.followup.send(embed=self.embeds.warning(title="No stats yet", description="No completed matches/stat lines found."))
+            return
+
+        if players:
+            text_players = self.leaderboard_view.render_players(
+                players,
+                opts=LeaderboardOptions(title=f"Event {event_id}"),
+            )
+            await interaction.followup.send(content=text_players)
+
+        if teams:
+            text_teams = self.leaderboard_view.render_teams(teams, title=f"Event {event_id}")
+            await interaction.followup.send(content=text_teams)
 
     @event.command(name="report", description="Report a match winner (and advance bracket).")
     @app_commands.describe(
@@ -723,75 +1046,14 @@ class EventsCog(commands.Cog):
         await interaction.followup.send(
             embed=self.embeds.success(
                 title="Match recorded",
-                description=(
-                    f"Recorded `{str(match_code).upper()}` winner seed `{winner_seed}`.\n"
-                    f"Bracket image will be updated automatically."
-                ),
+                description=(f"Recorded `{str(match_code).upper()}` winner seed `{winner_seed}`.\nBracket images will be updated automatically."),
             )
         )
 
-        # Auto-regenerate bracket image after each report
         if isinstance(interaction.channel, discord.TextChannel):
             await self._upsert_bracket_image_post(event_id, interaction.channel)
+            await self._upsert_current_round_image_post(event_id, interaction.channel)
 
-    @event.command(name="bracket_image", description="Show the current bracket as a drawn PNG.")
-    async def bracket_image(self, interaction: discord.Interaction, event_id: int) -> None:
-        await interaction.response.defer(ephemeral=False)
-
-        ev = await self.event_repo.get_event(event_id=event_id)
-        if not ev:
-            await interaction.followup.send(embed=self.embeds.error(title="Not found", description="Event not found."))
-            return
-
-        teams = await self.event_repo.list_event_teams(event_id=event_id)
-        matches = await self.event_repo.list_matches(event_id=event_id)
-
-        if not teams:
-            await interaction.followup.send(embed=self.embeds.warning(title="No teams", description="No event teams found yet."))
-            return
-
-        teams_by_seed: dict[int, dict[str, Any]] = {}
-        for t in teams:
-            seed = t.get("seed")
-            if seed is None:
-                continue
-            teams_by_seed[int(seed)] = {
-                "event_team_id": int(t["event_team_id"]),
-                "display_name": t.get("display_name") or f"Team {seed}",
-            }
-
-        png = self.bracket_diagram.render_png(
-            event_id=event_id,
-            event_format=str(ev.get("format") or "double_elim"),
-            teams_by_seed=teams_by_seed,
-            matches=list(matches or []),
-            title=f"Event {event_id} Bracket",
-        )
-
-        fp = BytesIO(png)
-        await interaction.followup.send(file=discord.File(fp, filename=f"event_{event_id}_bracket.png"))
-
-    @event.command(name="leaderboard", description="Show event leaderboard (players + teams).")
-    async def leaderboard(self, interaction: discord.Interaction, event_id: int) -> None:
-        await interaction.response.defer(ephemeral=False)
-
-        players = await self.stats.get_player_leaderboard(event_id=event_id)
-        teams = await self.stats.get_team_records(event_id=event_id)
-
-        if not players and not teams:
-            await interaction.followup.send(embed=self.embeds.warning(title="No stats yet", description="No completed matches/stat lines found."))
-            return
-
-        if players:
-            text_players = self.leaderboard_view.render_players(
-                players,
-                opts=LeaderboardOptions(title=f"Event {event_id}"),
-            )
-            await interaction.followup.send(content=text_players)
-
-        if teams:
-            text_teams = self.leaderboard_view.render_teams(teams, title=f"Event {event_id}")
-            await interaction.followup.send(content=text_teams)
 
 
 async def setup(
